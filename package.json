@@ -1,24 +1,21 @@
 {
   "name": "wa-server",
-  "version": "1.0.0",
-  "description": "Business OS WhatsApp WebSocket backend server using Baileys",
+  "version": "1.0.1",
+  "description": "Business OS WhatsApp WebSocket backend",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "node server.js"
   },
   "engines": {
     "node": ">=20"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
-    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "@whiskeysockets/baileys": "^6.7.16",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
-    "express": "^5.2.1",
+    "express": "^4.21.2",
+    "pino": "^9.0.0",
     "qrcode": "^1.5.4",
-    "ws": "^8.20.0"
+    "ws": "^8.18.0"
   }
 }
