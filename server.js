@@ -52,7 +52,8 @@ const MESSAGE_LIMITS = {
   maxPerDay: 200,
   maxNewContactsPerDay: 50,
 };
-const msgCounts = new Map();
+const msgCounts    = new Map();
+const aiRateLimits = new Map(); // `ai_${sessionId}_${phone}` → lastSentMs
 
 function rateCheck(sid) {
   const today = new Date().toDateString();
@@ -90,7 +91,7 @@ function sendToWs(wsId, event, data) {
 }
 
 // ── createSession ─────────────────────────────────────────────────────────────
-async function createSession(sessionId, wsId) {
+async function createSession(sessionId, wsId, userId = null) {
   const sessionDir = path.join(AUTH_DIR, sessionId);
   fs.mkdirSync(sessionDir, { recursive: true });
 
@@ -136,7 +137,7 @@ async function createSession(sessionId, wsId) {
   }
 
   // FIX BUG 1 & 3: store wsId not ws reference; broadcast uses live lookup
-  sessions.set(sessionId, { sock, wsId, connected: false });
+  sessions.set(sessionId, { sock, wsId, userId, connected: false });
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -176,13 +177,15 @@ async function createSession(sessionId, wsId) {
         fs.rmSync(sessionDir, { recursive: true, force: true });
       } else {
         // FIX BUG 3: reconnect uses current wsId from sessions map, not stale ws
-        const currentWsId = sessions.get(sessionId)?.wsId || wsId;
-        setTimeout(() => createSession(sessionId, currentWsId), 4000);
+        const cur = sessions.get(sessionId);
+        const currentWsId = cur?.wsId || wsId;
+        const currentUserId = cur?.userId || userId;
+        setTimeout(() => createSession(sessionId, currentWsId, currentUserId), 4000);
       }
     }
   });
 
-  sock.ev.on('messages.upsert', ({ messages, type }) => {
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
     const msgs = messages.map(m => ({
       id: m.key.id,
@@ -196,6 +199,44 @@ async function createSession(sessionId, wsId) {
       name: m.pushName,
     }));
     broadcast(sessionId, 'messages', { sessionId, messages: msgs });
+
+    // AI auto-reply
+    const currentSession = sessions.get(sessionId);
+    if (!currentSession?.userId) return;
+    const MAIN_APP  = process.env.MAIN_APP_URL         || 'https://clickdz.cloud';
+    const WA_SECRET = process.env.WA_WEBHOOK_SECRET    || 'bdz-wa-secret-2025';
+
+    for (const m of messages) {
+      if (m.key.fromMe) continue;
+      const text = m.message?.conversation || m.message?.extendedTextMessage?.text || '';
+      if (!text) continue;
+      const phone = (m.key.remoteJid || '').split('@')[0];
+      if (!phone) continue;
+      const aiKey = `ai_${sessionId}_${phone}`;
+      if (Date.now() - (aiRateLimits.get(aiKey) || 0) < 10000) continue;
+      try {
+        const res = await fetch(`${MAIN_APP}/api/wa/ai-reply`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-wa-secret': WA_SECRET },
+          body: JSON.stringify({
+            userId: currentSession.userId,
+            message: text,
+            contactName: m.pushName || '',
+            contactPhone: phone,
+          }),
+          signal: AbortSignal.timeout(20000),
+        });
+        const data = await res.json();
+        if (data.ok && data.reply) {
+          await new Promise(r => setTimeout(r, 5000));
+          await sock.sendMessage(m.key.remoteJid, { text: data.reply });
+          aiRateLimits.set(aiKey, Date.now());
+          recordSent(sessionId);
+        }
+      } catch (e) {
+        console.error('[ai-reply]', e.message);
+      }
+    }
   });
 
   sock.ev.on('chats.upsert', chats => {
@@ -220,7 +261,7 @@ wss.on('connection', (ws) => {
   ws.on('message', async (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
-    const { action, sessionId, data } = msg;
+    const { action, sessionId, userId: msgUserId, data } = msg;
     if (!action) return;
 
     switch (action) {
@@ -230,6 +271,7 @@ wss.on('connection', (ws) => {
         if (existing) {
           // Session exists — update ws reference so broadcasts go to this client
           existing.wsId = wsId;
+          if (msgUserId) existing.userId = msgUserId;
           if (existing.connected) {
             sendToWs(wsId, 'already_connected', { sessionId });
           } else {
@@ -237,9 +279,8 @@ wss.on('connection', (ws) => {
           }
         } else {
           sendToWs(wsId, 'connecting', { sessionId });
-          // FIX BUG 1: pass wsId, not ws reference
           try {
-            await createSession(sessionId, wsId);
+            await createSession(sessionId, wsId, msgUserId || null);
           } catch (e) {
             sendToWs(wsId, 'error', { message: e.message });
           }
