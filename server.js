@@ -159,6 +159,11 @@ async function createSession(sessionId, wsId, userId = null) {
       const s = sessions.get(sessionId);
       if (s) s.connected = true;
       const user = sock.user;
+      // Persist meta so this session survives a Railway restart
+      try {
+        const metaPath = path.join(AUTH_DIR, `${sessionId}.meta.json`);
+        fs.writeFileSync(metaPath, JSON.stringify({ sessionId, userId: s?.userId || userId, connectedAt: Date.now() }));
+      } catch {}
       broadcast(sessionId, 'connected', {
         sessionId,
         phone: user?.id?.split(':')[0] || '',
@@ -175,6 +180,7 @@ async function createSession(sessionId, wsId, userId = null) {
       if (loggedOut) {
         sessions.delete(sessionId);
         fs.rmSync(sessionDir, { recursive: true, force: true });
+        try { fs.unlinkSync(path.join(AUTH_DIR, `${sessionId}.meta.json`)); } catch {}
       } else {
         // FIX BUG 3: reconnect uses current wsId from sessions map, not stale ws
         const cur = sessions.get(sessionId);
@@ -246,6 +252,29 @@ async function createSession(sessionId, wsId, userId = null) {
   sock.ev.on('contacts.upsert', contacts => {
     broadcast(sessionId, 'contacts', { sessionId, contacts: contacts.slice(0, 500) });
   });
+}
+
+// ── Restore persisted sessions after Railway restart ─────────────────────────
+async function restorePersistedSessions() {
+  let files;
+  try { files = fs.readdirSync(AUTH_DIR); } catch { return; }
+  const metas = files.filter(f => f.endsWith('.meta.json'));
+  if (metas.length === 0) return;
+  console.log(`[wa] Restoring ${metas.length} persisted session(s)…`);
+  for (let i = 0; i < metas.length; i++) {
+    const metaPath = path.join(AUTH_DIR, metas[i]);
+    try {
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      if (!meta.sessionId) { fs.unlinkSync(metaPath); continue; }
+      const sessionDir = path.join(AUTH_DIR, meta.sessionId);
+      if (!fs.existsSync(sessionDir)) { fs.unlinkSync(metaPath); continue; }
+      if (sessions.has(meta.sessionId)) continue;
+      await new Promise(r => setTimeout(r, 1000 * i));
+      createSession(meta.sessionId, null, meta.userId || null);
+    } catch (e) {
+      console.error('[wa] Restore failed for', metas[i], e.message);
+    }
+  }
 }
 
 // ── WebSocket server ──────────────────────────────────────────────────────────
@@ -328,8 +357,20 @@ wss.on('connection', (ws) => {
           sessions.delete(sessionId);
           const dir = path.join(AUTH_DIR, sessionId);
           fs.rmSync(dir, { recursive: true, force: true });
+          try { fs.unlinkSync(path.join(AUTH_DIR, `${sessionId}.meta.json`)); } catch {}
         }
         sendToWs(wsId, 'logged_out', { sessionId });
+        break;
+      }
+
+      case 'delete_session': {
+        const s = sessions.get(sessionId);
+        if (s?.sock) { try { await s.sock.logout(); } catch {} }
+        sessions.delete(sessionId);
+        const delDir = path.join(AUTH_DIR, sessionId);
+        fs.rmSync(delDir, { recursive: true, force: true });
+        try { fs.unlinkSync(path.join(AUTH_DIR, `${sessionId}.meta.json`)); } catch {}
+        sendToWs(wsId, 'session_deleted', { sessionId });
         break;
       }
 
@@ -372,4 +413,5 @@ app.get('/sessions', (_, res) => {
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`[wa-server] Listening on :${PORT}`);
+  setTimeout(restorePersistedSessions, 3000);
 });
