@@ -1,0 +1,4 @@
+node_modules/
+auth_sessions/
+.env
+*.log
