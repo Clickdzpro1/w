@@ -156,7 +156,7 @@ function emitAuthenticating(sessionId, source = 'authenticating') {
   if (!session || session.connected || session.phase === 'connected') return;
   if (!session.qrEmittedAt) return;
   setSessionPhase(sessionId, 'authenticating', { event: source, scannedAt: session.scannedAt || Date.now() });
-  broadcast(sessionId, 'authenticated', {
+  broadcast(sessionId, 'authenticating', {
     sessionId,
     requestId: session.requestId || null,
     status: 'authenticating',
@@ -343,6 +343,18 @@ async function createSession(sessionId, wsId, userId = null, options = {}) {
         sessions.delete(sessionId);
         chatStores.delete(sessionId);
         safeRmSessionFiles(sessionId);
+      } else if (code === DisconnectReason.restartRequired || code === 515) {
+        const currentWsId = cur?.wsId || wsId;
+        const currentUserId = cur?.userId || userId;
+        const currentRequestId = cur?.requestId || requestId || null;
+        console.log('[wa] Restart required after auth; reconnecting saved session:', sessionId, code || '');
+        emitSessionStatus(sessionId, 'authenticating', 'QR scanned. Finalizing WhatsApp session...', { event: 'restart_required', code: code || '' });
+        sessions.delete(sessionId);
+        setTimeout(() => createSession(sessionId, currentWsId, currentUserId, {
+          allowQr: false,
+          restore: false,
+          requestId: currentRequestId,
+        }), 1500);
       } else if (cur?.phase === 'authenticating' || cur?.scannedAt) {
         console.log('[wa] Auth handshake closed after scan; keeping session for diagnostics:', sessionId, code || '');
         setTimeout(() => {
