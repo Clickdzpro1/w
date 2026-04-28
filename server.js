@@ -29,6 +29,8 @@ const wss = new WebSocketServer({ server });
 const sessions  = new Map(); // sessionId ? { sock, wsId, connected }
 const wsClients = new Map(); // wsId      ? WebSocket
 const chatStores = new Map(); // sessionId -> Map(jid -> chat summary)
+const messageStores = new Map(); // sessionId -> Map(jid -> Map(messageId -> message))
+const contactStores = new Map(); // sessionId -> Map(jid -> contact)
 
 let wsCounter = 0;
 function assignWsId(ws) {
@@ -51,6 +53,9 @@ const WA_WEB_VERSION_OVERRIDE = (process.env.WA_WEB_VERSION_OVERRIDE || '')
   .map((part) => Number(part.trim()))
   .filter((part) => Number.isFinite(part));
 const QR_AUTH_TIMEOUT_MS = Number(process.env.WA_QR_AUTH_TIMEOUT_MS || 45000);
+const MAX_STORED_CHATS = Number(process.env.WA_MAX_STORED_CHATS || 500);
+const MAX_STORED_MESSAGES_PER_CHAT = Number(process.env.WA_MAX_STORED_MESSAGES_PER_CHAT || 120);
+const SYNC_FULL_HISTORY = String(process.env.WA_SYNC_FULL_HISTORY || 'true') !== 'false';
 
 // -- Anti-ban limits ----------------------------------------------------------
 const MESSAGE_LIMITS = {
@@ -165,6 +170,58 @@ function emitAuthenticating(sessionId, source = 'authenticating') {
   });
 }
 
+function unwrapMessageContent(message = {}) {
+  let content = message || {};
+  for (let i = 0; i < 4; i++) {
+    if (content.ephemeralMessage?.message) content = content.ephemeralMessage.message;
+    else if (content.viewOnceMessage?.message) content = content.viewOnceMessage.message;
+    else if (content.viewOnceMessageV2?.message) content = content.viewOnceMessageV2.message;
+    else if (content.documentWithCaptionMessage?.message) content = content.documentWithCaptionMessage.message;
+    else break;
+  }
+  return content || {};
+}
+
+function messageBody(message = {}) {
+  const content = unwrapMessageContent(message);
+  return content.conversation
+    || content.extendedTextMessage?.text
+    || content.imageMessage?.caption
+    || content.videoMessage?.caption
+    || content.documentMessage?.caption
+    || content.documentMessage?.fileName
+    || content.contactMessage?.displayName
+    || content.contactsArrayMessage?.displayName
+    || content.locationMessage?.name
+    || content.liveLocationMessage?.caption
+    || content.pollCreationMessage?.name
+    || content.reactionMessage?.text
+    || content.buttonsResponseMessage?.selectedDisplayText
+    || content.listResponseMessage?.title
+    || '';
+}
+
+function messageKind(message = {}) {
+  const content = unwrapMessageContent(message);
+  if (content.conversation || content.extendedTextMessage) return 'text';
+  if (content.imageMessage) return 'image';
+  if (content.videoMessage) return 'video';
+  if (content.audioMessage) return content.audioMessage.ptt ? 'voice' : 'audio';
+  if (content.documentMessage) return 'document';
+  if (content.stickerMessage) return 'sticker';
+  if (content.contactMessage || content.contactsArrayMessage) return 'contact';
+  if (content.locationMessage || content.liveLocationMessage) return 'location';
+  if (content.pollCreationMessage) return 'poll';
+  if (content.reactionMessage) return 'reaction';
+  return 'media';
+}
+
+function jidName(sessionId, jid, fallback = '') {
+  const normalized = String(jid || '').toLowerCase();
+  const contact = contactStores.get(sessionId)?.get(normalized);
+  return contact?.name || contact?.notify || contact?.verifiedName || contact?.pushName || fallback || normalized.split('@')[0] || 'WhatsApp chat';
+}
+
 function upsertSessionChat(sessionId, chat) {
   const jid = String(chat?.id || chat?.jid || chat?.remoteJid || chat?.key?.remoteJid || chat?.from || '').toLowerCase();
   if (!sessionId || !jid) return;
@@ -175,9 +232,16 @@ function upsertSessionChat(sessionId, chat) {
     ...chat,
     id: jid,
     jid,
-    name: chat?.name || chat?.pushName || chat?.notify || prev.name || jid.split('@')[0],
-    updatedAt: Date.now(),
+    name: chat?.name || chat?.pushName || chat?.notify || prev.name || jidName(sessionId, jid),
+    conversationTimestamp: chat?.conversationTimestamp || chat?.timestamp || prev.conversationTimestamp || Date.now(),
+    updatedAt: chat?.updatedAt || Date.now(),
   });
+  if (store.size > MAX_STORED_CHATS) {
+    const oldest = Array.from(store.values())
+      .sort((a, b) => Number(a.updatedAt || a.conversationTimestamp || 0) - Number(b.updatedAt || b.conversationTimestamp || 0))
+      .slice(0, store.size - MAX_STORED_CHATS);
+    oldest.forEach((item) => store.delete(item.jid || item.id));
+  }
   chatStores.set(sessionId, store);
 }
 
@@ -187,6 +251,77 @@ function getSessionChats(sessionId) {
   return Array.from(store.values())
     .sort((a, b) => Number(b.updatedAt || b.conversationTimestamp || 0) - Number(a.updatedAt || a.conversationTimestamp || 0))
     .slice(0, 100);
+}
+
+function normalizeMessage(sessionId, raw = {}) {
+  const jid = String(raw.key?.remoteJid || raw.jid || raw.chatId || raw.from || raw.to || '').toLowerCase();
+  const id = String(raw.key?.id || raw.id || `${jid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+  const kind = messageKind(raw.message || raw);
+  const body = messageBody(raw.message || raw);
+  const timestamp = Number(raw.messageTimestamp || raw.timestamp || Date.now());
+  return {
+    id,
+    jid,
+    chatId: jid,
+    from: jid,
+    fromMe: raw.key?.fromMe !== undefined ? !!raw.key.fromMe : !!raw.fromMe,
+    body: body || (kind === 'text' ? '' : `${kind[0].toUpperCase()}${kind.slice(1)} message`),
+    text: body,
+    kind,
+    timestamp,
+    messageTimestamp: timestamp,
+    name: raw.pushName || jidName(sessionId, jid),
+    pushName: raw.pushName || jidName(sessionId, jid),
+    status: raw.status || 'received',
+  };
+}
+
+function upsertSessionMessage(sessionId, raw = {}) {
+  const msg = normalizeMessage(sessionId, raw);
+  if (!sessionId || !msg.jid || !msg.id) return null;
+  const byChat = messageStores.get(sessionId) || new Map();
+  const messages = byChat.get(msg.jid) || new Map();
+  messages.set(msg.id, { ...(messages.get(msg.id) || {}), ...msg });
+  if (messages.size > MAX_STORED_MESSAGES_PER_CHAT) {
+    const extra = Array.from(messages.values())
+      .sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0))
+      .slice(0, messages.size - MAX_STORED_MESSAGES_PER_CHAT);
+    extra.forEach((item) => messages.delete(item.id));
+  }
+  byChat.set(msg.jid, messages);
+  messageStores.set(sessionId, byChat);
+  upsertSessionChat(sessionId, {
+    id: msg.jid,
+    jid: msg.jid,
+    name: msg.name || jidName(sessionId, msg.jid),
+    lastMessage: msg,
+    conversationTimestamp: msg.timestamp,
+    updatedAt: Date.now(),
+  });
+  return msg;
+}
+
+function getSessionMessages(sessionId, jid, limit = 50) {
+  const normalized = String(jid || '').toLowerCase();
+  const messages = messageStores.get(sessionId)?.get(normalized);
+  if (!messages) return [];
+  return Array.from(messages.values())
+    .sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0))
+    .slice(-Math.max(1, Math.min(Number(limit) || 50, MAX_STORED_MESSAGES_PER_CHAT)));
+}
+
+function upsertSessionContact(sessionId, contact = {}) {
+  const jid = String(contact.id || contact.jid || contact.lid || '').toLowerCase();
+  if (!sessionId || !jid) return;
+  const store = contactStores.get(sessionId) || new Map();
+  store.set(jid, { ...(store.get(jid) || {}), ...contact, id: jid });
+  contactStores.set(sessionId, store);
+  const chats = chatStores.get(sessionId);
+  const chat = chats?.get(jid);
+  const name = contact.name || contact.notify || contact.verifiedName || contact.pushName;
+  if (chat && name) {
+    chats.set(jid, { ...chat, name });
+  }
 }
 
 // -- createSession -------------------------------------------------------------
@@ -229,7 +364,7 @@ async function createSession(sessionId, wsId, userId = null, options = {}) {
       printQRInTerminal: false,
       browser: ['Business OS', 'Chrome', '120.0.0'],
       generateHighQualityLinkPreview: false,
-      syncFullHistory: false,
+      syncFullHistory: SYNC_FULL_HISTORY,
       connectTimeoutMs: 30000,
       defaultQueryTimeoutMs: 20000,
       keepAliveIntervalMs: 10000,
@@ -337,11 +472,15 @@ async function createSession(sessionId, wsId, userId = null, options = {}) {
       if (loggedOut) {
         sessions.delete(sessionId);
         chatStores.delete(sessionId);
+        messageStores.delete(sessionId);
+        contactStores.delete(sessionId);
         safeRmSessionFiles(sessionId);
       } else if (!cur?.wsId || cur?.restore) {
         console.log('[wa] Stale restored session closed and cleaned:', sessionId, code || '');
         sessions.delete(sessionId);
         chatStores.delete(sessionId);
+        messageStores.delete(sessionId);
+        contactStores.delete(sessionId);
         safeRmSessionFiles(sessionId);
       } else if (code === DisconnectReason.restartRequired || code === 515) {
         const currentWsId = cur?.wsId || wsId;
@@ -384,32 +523,24 @@ async function createSession(sessionId, wsId, userId = null, options = {}) {
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-    const msgs = messages.map(m => ({
-      id: m.key.id,
-      from: m.key.remoteJid,
-      fromMe: m.key.fromMe,
-      body: m.message?.conversation
-         || m.message?.extendedTextMessage?.text
-         || m.message?.imageMessage?.caption
-         || '',
-      timestamp: m.messageTimestamp,
-      name: m.pushName,
-    }));
-    for (const msg of msgs) {
-      upsertSessionChat(sessionId, {
-        id: msg.from,
-        jid: msg.from,
-        name: msg.name || msg.from,
-        lastMessage: msg,
-        conversationTimestamp: msg.timestamp,
-        updatedAt: Date.now(),
-      });
-    }
+  sock.ev.on('messaging-history.set', ({ chats = [], contacts = [], messages = [] } = {}) => {
+    for (const contact of contacts || []) upsertSessionContact(sessionId, contact);
+    for (const chat of chats || []) upsertSessionChat(sessionId, chat);
+    for (const message of messages || []) upsertSessionMessage(sessionId, message);
+    broadcast(sessionId, 'chats', { sessionId, chats: getSessionChats(sessionId), source: 'history_set' });
+  });
+
+  sock.ev.on('contacts.update', contacts => {
+    for (const contact of contacts || []) upsertSessionContact(sessionId, contact);
+  });
+
+  sock.ev.on('messages.upsert', async ({ messages, type } = {}) => {
+    const msgs = (messages || []).map(m => upsertSessionMessage(sessionId, m)).filter(Boolean);
+    if (msgs.length === 0) return;
     broadcast(sessionId, 'messages', { sessionId, messages: msgs });
 
     // AI auto-reply
+    if (type !== 'notify') return;
     const currentSession = sessions.get(sessionId);
     if (!currentSession?.userId) return;
     const MAIN_APP  = process.env.MAIN_APP_URL         || 'https://clickdz.cloud';
@@ -453,7 +584,13 @@ async function createSession(sessionId, wsId, userId = null, options = {}) {
     broadcast(sessionId, 'chats', { sessionId, chats: getSessionChats(sessionId) });
   });
 
+  sock.ev.on('chats.update', chats => {
+    for (const chat of chats || []) upsertSessionChat(sessionId, chat);
+    broadcast(sessionId, 'chats', { sessionId, chats: getSessionChats(sessionId) });
+  });
+
   sock.ev.on('contacts.upsert', contacts => {
+    for (const contact of contacts || []) upsertSessionContact(sessionId, contact);
     broadcast(sessionId, 'contacts', { sessionId, contacts: contacts.slice(0, 500) });
   });
 }
@@ -566,16 +703,19 @@ wss.on('connection', (ws) => {
         const s = sessions.get(sessionId);
         if (!s?.sock) break;
         try {
-          const msgs = await s.sock.loadMessages(data.jid, data.count || 30);
-          sendToWs(wsId, 'history', { sessionId, jid: data.jid, messages: msgs });
-        } catch {}
+          const jid = data?.jid || data?.chatId || data?.to || '';
+          const msgs = getSessionMessages(sessionId, jid, data?.count || data?.limit || 50);
+          sendToWs(wsId, 'history', { sessionId, jid, messages: msgs });
+        } catch (e) {
+          sendToWs(wsId, 'error', { sessionId, requestId, phase: 'message', message: 'Could not load message history.' });
+        }
         break;
       }
 
       case 'get_contacts': {
         const s = sessions.get(sessionId);
         if (!s?.sock) break;
-        const contacts = Object.values(s.sock.store?.contacts || {}).slice(0, 500);
+        const contacts = Array.from((contactStores.get(sessionId) || new Map()).values()).slice(0, 500);
         sendToWs(wsId, 'contacts', { sessionId, contacts });
         break;
       }
@@ -586,6 +726,8 @@ wss.on('connection', (ws) => {
           try { await s.sock.logout(); } catch {}
           sessions.delete(sessionId);
           chatStores.delete(sessionId);
+          messageStores.delete(sessionId);
+          contactStores.delete(sessionId);
           const dir = path.join(AUTH_DIR, sessionId);
           fs.rmSync(dir, { recursive: true, force: true });
           try { fs.unlinkSync(path.join(AUTH_DIR, `${sessionId}.meta.json`)); } catch {}
@@ -599,6 +741,8 @@ wss.on('connection', (ws) => {
         if (s?.sock) { try { await s.sock.logout(); } catch {} }
         sessions.delete(sessionId);
         chatStores.delete(sessionId);
+        messageStores.delete(sessionId);
+        contactStores.delete(sessionId);
         const delDir = path.join(AUTH_DIR, sessionId);
         fs.rmSync(delDir, { recursive: true, force: true });
         try { fs.unlinkSync(path.join(AUTH_DIR, `${sessionId}.meta.json`)); } catch {}
@@ -659,6 +803,8 @@ app.get('/debug/sessions', (req, res) => {
     restore: !!s.restore,
     allowQr: !!s.allowQr,
     chats: getSessionChats(id).length,
+    messageThreads: messageStores.get(id)?.size || 0,
+    contacts: contactStores.get(id)?.size || 0,
   }));
   res.json({ ok: true, sessions: list, clients: wsClients.size, authDir: AUTH_DIR });
 });
