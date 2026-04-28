@@ -1,4 +1,4 @@
-require('dotenv').config();
+ï»¿require('dotenv').config();
 const express = require('express');
 const { createServer } = require('http');
 const { WebSocketServer } = require('ws');
@@ -41,10 +41,10 @@ function assignWsId(ws) {
 const AUTH_DIR = process.env.WA_AUTH_DIR || path.join(__dirname, 'auth_sessions');
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
-// Silent logger — prevent Baileys flooding Railway logs
+// Silent logger â€” prevent Baileys flooding Railway logs
 const silentLogger = pino({ level: 'silent' });
 
-// Known-good fallback WA version — used when fetchLatestBaileysVersion fails
+// Known-good fallback WA version â€” used when fetchLatestBaileysVersion fails
 const FALLBACK_VERSION = [2, 3000, 1015901307];
 const WA_WEB_VERSION_OVERRIDE = (process.env.WA_WEB_VERSION_OVERRIDE || '')
   .split('.')
@@ -77,7 +77,7 @@ function recordSent(sid) {
   msgCounts.set(sid, r);
 }
 
-// -- broadcast — always looks up CURRENT ws, never uses stale reference --------
+// -- broadcast â€” always looks up CURRENT ws, never uses stale reference --------
 function broadcast(sessionId, event, data) {
   const session = sessions.get(sessionId);
   const wsId = session?.wsId;
@@ -452,7 +452,7 @@ async function restorePersistedSessions() {
   try { files = fs.readdirSync(AUTH_DIR); } catch { return; }
   const metas = files.filter(f => f.endsWith('.meta.json'));
   if (metas.length === 0) return;
-  console.log(`[wa] Restoring ${metas.length} persisted session(s)…`);
+  console.log(`[wa] Restoring ${metas.length} persisted session(s)â€¦`);
   for (let i = 0; i < metas.length; i++) {
     const metaPath = path.join(AUTH_DIR, metas[i]);
     try {
@@ -630,7 +630,7 @@ app.get('/sessions', (_, res) => {
 });
 
 app.get('/debug/sessions', (req, res) => {
-  const secret = process.env.WA_DEBUG_SECRET || process.env.CRON_SECRET || '';
+  const secret = process.env.WA_DEBUG_SECRET || process.env.CRON_SECRET || process.env.WA_WEBHOOK_SECRET || '';
   const provided = String(req.headers['x-debug-secret'] || req.query.secret || '');
   if (!secret || provided !== secret) return res.status(404).json({ ok: false });
   const list = Array.from(sessions.entries()).map(([id, s]) => ({
@@ -657,3 +657,4 @@ server.listen(PORT, () => {
   console.log(`[wa-server] Listening on :${PORT}`);
   setTimeout(restorePersistedSessions, 3000);
 });
+
