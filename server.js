@@ -9,10 +9,12 @@ const {
   DisconnectReason,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
+  downloadMediaMessage,
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors({ origin: '*' }));
@@ -31,6 +33,7 @@ const wsClients = new Map(); // wsId      ? WebSocket
 const chatStores = new Map(); // sessionId -> Map(jid -> chat summary)
 const messageStores = new Map(); // sessionId -> Map(jid -> Map(messageId -> message))
 const contactStores = new Map(); // sessionId -> Map(jid -> contact)
+const mediaStores = new Map(); // sessionId -> Map(messageId -> { raw, token, mimetype, kind })
 
 let wsCounter = 0;
 function assignWsId(ws) {
@@ -56,6 +59,14 @@ const QR_AUTH_TIMEOUT_MS = Number(process.env.WA_QR_AUTH_TIMEOUT_MS || 45000);
 const MAX_STORED_CHATS = Number(process.env.WA_MAX_STORED_CHATS || 500);
 const MAX_STORED_MESSAGES_PER_CHAT = Number(process.env.WA_MAX_STORED_MESSAGES_PER_CHAT || 120);
 const SYNC_FULL_HISTORY = String(process.env.WA_SYNC_FULL_HISTORY || 'true') !== 'false';
+const PUBLIC_BASE_URL = (
+  process.env.PUBLIC_BASE_URL
+  || process.env.WA_PUBLIC_URL
+  || process.env.WA_SERVER_URL
+  || process.env.NEXT_PUBLIC_WA_SERVER_URL
+  || process.env.RAILWAY_STATIC_URL
+  || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '')
+).replace(/\/$/, '');
 
 // -- Anti-ban limits ----------------------------------------------------------
 const MESSAGE_LIMITS = {
@@ -216,10 +227,100 @@ function messageKind(message = {}) {
   return 'media';
 }
 
+function createMediaToken() {
+  return crypto.randomBytes(18).toString('hex');
+}
+
+function mediaPublicUrl(sessionId, messageId, token) {
+  const urlPath = `/media/${encodeURIComponent(sessionId)}/${encodeURIComponent(messageId)}?token=${encodeURIComponent(token)}`;
+  return PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}${urlPath}` : urlPath;
+}
+
+function firstUrl(text = '') {
+  const match = String(text || '').match(/https?:\/\/[^\s<>"']+/i);
+  return match ? match[0] : '';
+}
+
+function mediaInfo(message = {}) {
+  const content = unwrapMessageContent(message);
+  const variants = [
+    ['image', content.imageMessage],
+    ['video', content.videoMessage],
+    [content.audioMessage?.ptt ? 'voice' : 'audio', content.audioMessage],
+    ['document', content.documentMessage],
+    ['sticker', content.stickerMessage],
+  ];
+  const picked = variants.find(([, value]) => value);
+  const ext = content.extendedTextMessage;
+  const text = ext?.text || content.conversation || '';
+  const linkUrl = ext?.matchedText || ext?.canonicalUrl || firstUrl(text);
+  const linkPreview = linkUrl ? {
+    url: linkUrl,
+    title: ext?.title || '',
+    description: ext?.description || '',
+  } : null;
+
+  if (!picked) return { media: null, linkPreview };
+
+  const [kind, value] = picked;
+  const fileName = value.fileName || value.title || `${kind}-${Date.now()}`;
+  return {
+    media: {
+      kind,
+      mimetype: value.mimetype || (kind === 'sticker' ? 'image/webp' : 'application/octet-stream'),
+      fileName,
+      caption: value.caption || '',
+      seconds: value.seconds || value.duration || null,
+      width: value.width || null,
+      height: value.height || null,
+      size: value.fileLength ? Number(value.fileLength) : null,
+    },
+    linkPreview,
+  };
+}
+
 function jidName(sessionId, jid, fallback = '') {
   const normalized = String(jid || '').toLowerCase();
   const contact = contactStores.get(sessionId)?.get(normalized);
-  return contact?.name || contact?.notify || contact?.verifiedName || contact?.pushName || fallback || normalized.split('@')[0] || 'WhatsApp chat';
+  const label = contact?.name || contact?.notify || contact?.verifiedName || contact?.pushName || '';
+  if (label && !looksLikeWaUid(label)) return label;
+  return contact?.displayPhone || fallback || normalized.split('@')[0] || 'WhatsApp chat';
+}
+
+function looksLikeWaUid(value = '') {
+  const raw = String(value || '').trim();
+  if (!raw) return true;
+  if (/@(s\.whatsapp\.net|c\.us|g\.us|lid)$/i.test(raw)) return true;
+  const digits = raw.replace(/\D/g, '');
+  return digits.length >= 8 && raw.replace(/[^\d+()\-\s]/g, '') === raw;
+}
+
+function displayPhoneFromContact(contact = {}) {
+  const raw = contact.phoneNumber || contact.phone || contact.waId || contact.id || contact.jid || '';
+  const left = String(raw || '').split('@')[0].split(':')[0].replace(/[^\d+]/g, '');
+  const digits = left.replace(/\D/g, '');
+  if (!digits || digits.length < 8) return '';
+  return left.startsWith('+') ? left : `+${digits}`;
+}
+
+function contactAliases(contact = {}) {
+  const aliases = [
+    contact.id,
+    contact.jid,
+    contact.lid,
+    contact.phoneNumber,
+    contact.phone,
+    contact.waId,
+  ];
+  const out = new Set();
+  for (const alias of aliases) {
+    const raw = String(alias || '').trim().toLowerCase();
+    if (!raw) continue;
+    out.add(raw);
+    const digits = raw.split('@')[0].split(':')[0].replace(/\D/g, '');
+    if (digits.length >= 8) out.add(`${digits}@s.whatsapp.net`);
+  }
+  return Array.from(out);
 }
 
 function upsertSessionChat(sessionId, chat) {
@@ -227,12 +328,16 @@ function upsertSessionChat(sessionId, chat) {
   if (!sessionId || !jid) return;
   const store = chatStores.get(sessionId) || new Map();
   const prev = store.get(jid) || {};
+  const contact = contactStores.get(sessionId)?.get(jid);
+  const candidateName = chat?.name || chat?.pushName || chat?.notify || prev.name || '';
+  const resolvedName = looksLikeWaUid(candidateName) ? jidName(sessionId, jid) : candidateName;
   store.set(jid, {
     ...prev,
     ...chat,
     id: jid,
     jid,
-    name: chat?.name || chat?.pushName || chat?.notify || prev.name || jidName(sessionId, jid),
+    name: resolvedName || jidName(sessionId, jid),
+    phone: contact?.displayPhone || prev.phone || '',
     conversationTimestamp: chat?.conversationTimestamp || chat?.timestamp || prev.conversationTimestamp || Date.now(),
     updatedAt: chat?.updatedAt || Date.now(),
   });
@@ -258,6 +363,7 @@ function normalizeMessage(sessionId, raw = {}) {
   const id = String(raw.key?.id || raw.id || `${jid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
   const kind = messageKind(raw.message || raw);
   const body = messageBody(raw.message || raw);
+  const info = mediaInfo(raw.message || raw);
   const timestamp = Number(raw.messageTimestamp || raw.timestamp || Date.now());
   return {
     id,
@@ -273,12 +379,31 @@ function normalizeMessage(sessionId, raw = {}) {
     name: raw.pushName || jidName(sessionId, jid),
     pushName: raw.pushName || jidName(sessionId, jid),
     status: raw.status || 'received',
+    media: info.media,
+    linkPreview: info.linkPreview,
   };
 }
 
 function upsertSessionMessage(sessionId, raw = {}) {
   const msg = normalizeMessage(sessionId, raw);
   if (!sessionId || !msg.jid || !msg.id) return null;
+  if (msg.media && raw?.message) {
+    const mediaBySession = mediaStores.get(sessionId) || new Map();
+    const prev = mediaBySession.get(msg.id) || {};
+    const token = prev.token || createMediaToken();
+    mediaBySession.set(msg.id, {
+      raw,
+      token,
+      mimetype: msg.media.mimetype,
+      kind: msg.media.kind,
+      fileName: msg.media.fileName,
+    });
+    mediaStores.set(sessionId, mediaBySession);
+    msg.media = {
+      ...msg.media,
+      url: mediaPublicUrl(sessionId, msg.id, token),
+    };
+  }
   const byChat = messageStores.get(sessionId) || new Map();
   const messages = byChat.get(msg.jid) || new Map();
   messages.set(msg.id, { ...(messages.get(msg.id) || {}), ...msg });
@@ -311,16 +436,24 @@ function getSessionMessages(sessionId, jid, limit = 50) {
 }
 
 function upsertSessionContact(sessionId, contact = {}) {
-  const jid = String(contact.id || contact.jid || contact.lid || '').toLowerCase();
+  const aliases = contactAliases(contact);
+  const jid = aliases[0];
   if (!sessionId || !jid) return;
   const store = contactStores.get(sessionId) || new Map();
-  store.set(jid, { ...(store.get(jid) || {}), ...contact, id: jid });
+  const enriched = {
+    ...contact,
+    id: jid,
+    displayPhone: displayPhoneFromContact(contact),
+  };
+  for (const alias of aliases) {
+    store.set(alias, { ...(store.get(alias) || {}), ...enriched, id: alias });
+  }
   contactStores.set(sessionId, store);
   const chats = chatStores.get(sessionId);
-  const chat = chats?.get(jid);
-  const name = contact.name || contact.notify || contact.verifiedName || contact.pushName;
-  if (chat && name) {
-    chats.set(jid, { ...chat, name });
+  const name = contact.name || contact.notify || contact.verifiedName || contact.pushName || enriched.displayPhone;
+  for (const alias of aliases) {
+    const chat = chats?.get(alias);
+    if (chat && name) chats.set(alias, { ...chat, name, phone: enriched.displayPhone || chat.phone || '' });
   }
 }
 
@@ -474,6 +607,7 @@ async function createSession(sessionId, wsId, userId = null, options = {}) {
         chatStores.delete(sessionId);
         messageStores.delete(sessionId);
         contactStores.delete(sessionId);
+        mediaStores.delete(sessionId);
         safeRmSessionFiles(sessionId);
       } else if (!cur?.wsId || cur?.restore) {
         console.log('[wa] Stale restored session closed and cleaned:', sessionId, code || '');
@@ -481,6 +615,7 @@ async function createSession(sessionId, wsId, userId = null, options = {}) {
         chatStores.delete(sessionId);
         messageStores.delete(sessionId);
         contactStores.delete(sessionId);
+        mediaStores.delete(sessionId);
         safeRmSessionFiles(sessionId);
       } else if (code === DisconnectReason.restartRequired || code === 515) {
         const currentWsId = cur?.wsId || wsId;
@@ -548,7 +683,7 @@ async function createSession(sessionId, wsId, userId = null, options = {}) {
 
     for (const m of messages) {
       if (m.key.fromMe) continue;
-      const text = m.message?.conversation || m.message?.extendedTextMessage?.text || '';
+      const text = messageBody(m.message || m);
       if (!text) continue;
       const phone = (m.key.remoteJid || '').split('@')[0];
       if (!phone) continue;
@@ -728,6 +863,7 @@ wss.on('connection', (ws) => {
           chatStores.delete(sessionId);
           messageStores.delete(sessionId);
           contactStores.delete(sessionId);
+          mediaStores.delete(sessionId);
           const dir = path.join(AUTH_DIR, sessionId);
           fs.rmSync(dir, { recursive: true, force: true });
           try { fs.unlinkSync(path.join(AUTH_DIR, `${sessionId}.meta.json`)); } catch {}
@@ -743,6 +879,7 @@ wss.on('connection', (ws) => {
         chatStores.delete(sessionId);
         messageStores.delete(sessionId);
         contactStores.delete(sessionId);
+        mediaStores.delete(sessionId);
         const delDir = path.join(AUTH_DIR, sessionId);
         fs.rmSync(delDir, { recursive: true, force: true });
         try { fs.unlinkSync(path.join(AUTH_DIR, `${sessionId}.meta.json`)); } catch {}
@@ -768,6 +905,34 @@ wss.on('connection', (ws) => {
 });
 
 // -- HTTP routes ---------------------------------------------------------------
+app.get('/media/:sessionId/:messageId', async (req, res) => {
+  const { sessionId, messageId } = req.params;
+  const token = String(req.query.token || '');
+  const record = mediaStores.get(sessionId)?.get(messageId);
+  if (!record || !record.token || token !== record.token) {
+    return res.status(record ? 403 : 404).json({ ok: false, error: record ? 'forbidden' : 'not_found' });
+  }
+  const s = sessions.get(sessionId);
+  if (!s?.sock) return res.status(503).json({ ok: false, error: 'session_not_ready' });
+
+  try {
+    const buffer = await downloadMediaMessage(
+      record.raw,
+      'buffer',
+      {},
+      { logger: silentLogger, reuploadRequest: s.sock.updateMediaMessage },
+    );
+    const filename = String(record.fileName || `${record.kind || 'whatsapp'}-media`).replace(/[^\w.\-() ]+/g, '_').slice(0, 120);
+    res.setHeader('Content-Type', record.mimetype || 'application/octet-stream');
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+    return res.send(buffer);
+  } catch (e) {
+    console.error('[wa-media]', sessionId, messageId, e?.message || e);
+    return res.status(500).json({ ok: false, error: 'media_unavailable' });
+  }
+});
+
 app.get('/health', (_, res) => {
   res.json({
     ok: true,
