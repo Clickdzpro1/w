@@ -21,13 +21,13 @@ app.use(express.json());
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
-// ── Session store ────────────────────────────────────────────────────────────
+// Session store
 // sessions Map stores { sock, wsId, connected }
-// wsClients Map stores wsId → WebSocket instance
+// wsClients Map stores wsId -> WebSocket instance
 // This decouples WebSocket identity from Baileys sessions so stale-ws bugs
 // are impossible: broadcast always looks up the CURRENT live socket by wsId.
-const sessions  = new Map(); // sessionId → { sock, wsId, connected }
-const wsClients = new Map(); // wsId      → WebSocket
+const sessions  = new Map(); // sessionId -> { sock, wsId, connected }
+const wsClients = new Map(); // wsId      -> WebSocket
 
 let wsCounter = 0;
 function assignWsId(ws) {
@@ -40,20 +40,20 @@ function assignWsId(ws) {
 const AUTH_DIR = path.join(__dirname, 'auth_sessions');
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
-// Silent logger — prevent Baileys flooding Railway logs
+// Silent logger - prevent Baileys flooding Railway logs
 const silentLogger = pino({ level: 'silent' });
 
-// Known-good fallback WA version — used when fetchLatestBaileysVersion fails
+// Known-good fallback WA version - used when fetchLatestBaileysVersion fails
 const FALLBACK_VERSION = [2, 3000, 1015901307];
 
-// ── Anti-ban limits ──────────────────────────────────────────────────────────
+// Anti-ban limits
 const MESSAGE_LIMITS = {
   minDelayMs: 5000,
   maxPerDay: 200,
   maxNewContactsPerDay: 50,
 };
 const msgCounts    = new Map();
-const aiRateLimits = new Map(); // `ai_${sessionId}_${phone}` → lastSentMs
+const aiRateLimits = new Map(); // `ai_${sessionId}_${phone}` -> lastSentMs
 
 function rateCheck(sid) {
   const today = new Date().toDateString();
@@ -71,7 +71,7 @@ function recordSent(sid) {
   msgCounts.set(sid, r);
 }
 
-// ── broadcast — always looks up CURRENT ws, never uses stale reference ────────
+// broadcast - always looks up CURRENT ws, never uses stale reference
 function broadcast(sessionId, event, data) {
   const session = sessions.get(sessionId);
   const wsId = session?.wsId;
@@ -82,7 +82,7 @@ function broadcast(sessionId, event, data) {
   }
 }
 
-// ── Direct send to a specific wsId (used before session is created) ──────────
+// Direct send to a specific wsId (used before session is created)
 function sendToWs(wsId, event, data) {
   const ws = wsClients.get(wsId);
   if (ws?.readyState === 1) {
@@ -90,12 +90,27 @@ function sendToWs(wsId, event, data) {
   }
 }
 
-// ── createSession ─────────────────────────────────────────────────────────────
-async function createSession(sessionId, wsId, userId = null) {
+function safeRmSessionFiles(sessionId) {
+  if (!sessionId) return;
+  const dir = path.join(AUTH_DIR, sessionId);
+  fs.rmSync(dir, { recursive: true, force: true });
+  try { fs.unlinkSync(path.join(AUTH_DIR, `${sessionId}.meta.json`)); } catch {}
+}
+
+function closeSessionSocket(sessionId) {
+  const session = sessions.get(sessionId);
+  if (!session?.sock) return;
+  try { session.sock.end?.(); } catch {}
+  try { session.sock.ws?.close?.(); } catch {}
+}
+
+// createSession
+async function createSession(sessionId, wsId, userId = null, options = {}) {
+  const { allowQr = !!wsId, restore = false, requestId = null } = options;
   const sessionDir = path.join(AUTH_DIR, sessionId);
   fs.mkdirSync(sessionDir, { recursive: true });
 
-  // FIX BUG 2: timeout + fallback for fetchLatestBaileysVersion
+  // Timeout + fallback for fetchLatestBaileysVersion
   let version = FALLBACK_VERSION;
   try {
     const controller = new AbortController();
@@ -122,7 +137,7 @@ async function createSession(sessionId, wsId, userId = null) {
     sock = makeWASocket({
       version,
       auth: state,
-      logger: silentLogger,          // FIX BUG 4: suppress all Baileys logs
+      logger: silentLogger,
       printQRInTerminal: false,
       browser: ['Business OS', 'Chrome', '120.0.0'],
       generateHighQualityLinkPreview: false,
@@ -136,8 +151,8 @@ async function createSession(sessionId, wsId, userId = null) {
     return;
   }
 
-  // FIX BUG 1 & 3: store wsId not ws reference; broadcast uses live lookup
-  sessions.set(sessionId, { sock, wsId, userId, connected: false });
+  // Store wsId not ws reference; broadcast uses live lookup.
+  sessions.set(sessionId, { sock, wsId, userId, connected: false, allowQr, restore, requestId, connecting: true });
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -145,10 +160,17 @@ async function createSession(sessionId, wsId, userId = null) {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      const current = sessions.get(sessionId);
+      if (!current?.allowQr || !current?.wsId) {
+        console.log('[wa] Stale QR ignored and session cleaned:', sessionId);
+        closeSessionSocket(sessionId);
+        sessions.delete(sessionId);
+        safeRmSessionFiles(sessionId);
+        return;
+      }
       try {
         const qrDataUrl = await QRCode.toDataURL(qr, { width: 260, margin: 2, color: { dark: '#000000', light: '#ffffff' } });
-        // FIX BUG 1: broadcast uses current ws via sessionId lookup
-        broadcast(sessionId, 'qr', { qr: qrDataUrl, sessionId });
+        broadcast(sessionId, 'qr', { qr: qrDataUrl, sessionId, requestId: current.requestId || requestId || null });
         console.log('[wa] QR emitted for', sessionId);
       } catch (e) {
         broadcast(sessionId, 'error', { message: 'QR generation failed: ' + e.message });
@@ -157,15 +179,20 @@ async function createSession(sessionId, wsId, userId = null) {
 
     if (connection === 'open') {
       const s = sessions.get(sessionId);
-      if (s) s.connected = true;
+      if (s) {
+        s.connected = true;
+        s.connecting = false;
+        s.allowQr = false;
+      }
       const user = sock.user;
-      // Persist meta so this session survives a Railway restart
+      // Persist meta so this session survives a Railway restart.
       try {
         const metaPath = path.join(AUTH_DIR, `${sessionId}.meta.json`);
         fs.writeFileSync(metaPath, JSON.stringify({ sessionId, userId: s?.userId || userId, connectedAt: Date.now() }));
       } catch {}
       broadcast(sessionId, 'connected', {
         sessionId,
+        requestId: s?.requestId || requestId || null,
         phone: user?.id?.split(':')[0] || '',
         name: user?.name || '',
       });
@@ -175,18 +202,27 @@ async function createSession(sessionId, wsId, userId = null) {
     if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = code === DisconnectReason.loggedOut;
-      broadcast(sessionId, 'disconnected', { sessionId, loggedOut, code });
+      const cur = sessions.get(sessionId);
+      broadcast(sessionId, 'disconnected', { sessionId, requestId: cur?.requestId || requestId || null, loggedOut, code });
 
       if (loggedOut) {
         sessions.delete(sessionId);
-        fs.rmSync(sessionDir, { recursive: true, force: true });
-        try { fs.unlinkSync(path.join(AUTH_DIR, `${sessionId}.meta.json`)); } catch {}
+        safeRmSessionFiles(sessionId);
+      } else if (!cur?.wsId || cur?.restore) {
+        console.log('[wa] Stale restored session closed and cleaned:', sessionId, code || '');
+        sessions.delete(sessionId);
+        safeRmSessionFiles(sessionId);
       } else {
-        // FIX BUG 3: reconnect uses current wsId from sessions map, not stale ws
-        const cur = sessions.get(sessionId);
+        // Reconnect uses current wsId from sessions map, not stale ws.
         const currentWsId = cur?.wsId || wsId;
         const currentUserId = cur?.userId || userId;
-        setTimeout(() => createSession(sessionId, currentWsId, currentUserId), 4000);
+        const currentRequestId = cur?.requestId || requestId || null;
+        sessions.delete(sessionId);
+        setTimeout(() => createSession(sessionId, currentWsId, currentUserId, {
+          allowQr: false,
+          restore: false,
+          requestId: currentRequestId,
+        }), 4000);
       }
     }
   });
@@ -254,13 +290,13 @@ async function createSession(sessionId, wsId, userId = null) {
   });
 }
 
-// ── Restore persisted sessions after Railway restart ─────────────────────────
+// Restore persisted sessions after Railway restart
 async function restorePersistedSessions() {
   let files;
   try { files = fs.readdirSync(AUTH_DIR); } catch { return; }
   const metas = files.filter(f => f.endsWith('.meta.json'));
   if (metas.length === 0) return;
-  console.log(`[wa] Restoring ${metas.length} persisted session(s)…`);
+  console.log(`[wa] Restoring ${metas.length} persisted session(s)...`);
   for (let i = 0; i < metas.length; i++) {
     const metaPath = path.join(AUTH_DIR, metas[i]);
     try {
@@ -270,14 +306,14 @@ async function restorePersistedSessions() {
       if (!fs.existsSync(sessionDir)) { fs.unlinkSync(metaPath); continue; }
       if (sessions.has(meta.sessionId)) continue;
       await new Promise(r => setTimeout(r, 1000 * i));
-      createSession(meta.sessionId, null, meta.userId || null);
+      createSession(meta.sessionId, null, meta.userId || null, { allowQr: false, restore: true });
     } catch (e) {
       console.error('[wa] Restore failed for', metas[i], e.message);
     }
   }
 }
 
-// ── WebSocket server ──────────────────────────────────────────────────────────
+// WebSocket server
 wss.on('connection', (ws) => {
   const wsId = assignWsId(ws);
   console.log('[ws] Client connected:', wsId);
@@ -291,6 +327,8 @@ wss.on('connection', (ws) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
     const { action, sessionId, userId: msgUserId, data } = msg;
+    const requestId = msg.requestId || data?.requestId || null;
+    const restoreRequested = !!(msg.restore || data?.restore);
     if (!action) return;
 
     switch (action) {
@@ -298,22 +336,46 @@ wss.on('connection', (ws) => {
         if (!sessionId) break;
         const existing = sessions.get(sessionId);
         if (existing) {
-          // Session exists — update ws reference so broadcasts go to this client
           existing.wsId = wsId;
           if (msgUserId) existing.userId = msgUserId;
+          existing.requestId = requestId || existing.requestId || null;
           if (existing.connected) {
-            sendToWs(wsId, 'already_connected', { sessionId });
+            const user = existing.sock?.user;
+            sendToWs(wsId, 'connected', {
+              sessionId,
+              requestId: existing.requestId,
+              phone: user?.id?.split(':')[0] || '',
+              name: user?.name || '',
+            });
           } else {
-            sendToWs(wsId, 'connecting', { sessionId });
+            closeSessionSocket(sessionId);
+            sessions.delete(sessionId);
+            safeRmSessionFiles(sessionId);
+            sendToWs(wsId, 'connecting', { sessionId, requestId });
+            try {
+              await createSession(sessionId, wsId, msgUserId || existing.userId || null, { allowQr: !restoreRequested, restore: restoreRequested, requestId });
+            } catch (e) {
+              sendToWs(wsId, 'error', { sessionId, requestId, phase: 'login', message: e.message });
+            }
           }
         } else {
-          sendToWs(wsId, 'connecting', { sessionId });
+          sendToWs(wsId, 'connecting', { sessionId, requestId });
           try {
-            await createSession(sessionId, wsId, msgUserId || null);
+            await createSession(sessionId, wsId, msgUserId || null, { allowQr: !restoreRequested, restore: restoreRequested, requestId });
           } catch (e) {
-            sendToWs(wsId, 'error', { message: e.message });
+            sendToWs(wsId, 'error', { sessionId, requestId, phase: 'login', message: e.message });
           }
         }
+        break;
+      }
+
+      case 'sync_chats': {
+        const s = sessions.get(sessionId);
+        if (!s?.sock || !s.connected) {
+          sendToWs(wsId, 'error', { sessionId, requestId, phase: 'sync', message: 'Session is not ready for chat sync' });
+          break;
+        }
+        sendToWs(wsId, 'chats', { sessionId, requestId, chats: [] });
         break;
       }
 
@@ -391,7 +453,7 @@ wss.on('connection', (ws) => {
   });
 });
 
-// ── HTTP routes ───────────────────────────────────────────────────────────────
+// HTTP routes
 app.get('/health', (_, res) => {
   res.json({
     ok: true,
@@ -409,7 +471,7 @@ app.get('/sessions', (_, res) => {
   res.json(list);
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// Start
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`[wa-server] Listening on :${PORT}`);
